@@ -40,29 +40,50 @@ def load_wav_as_float(path: str):
     return data, sr
 
 
-def vad_silero(audio_path: str, min_segment_s: float = 0.3, max_segment_s: float = 1800.0) -> List[Tuple[int, int]]:
-    """ Return list of (start_ms, end_ms) speech segments using Silero VAD via torchaudio """
+def vad_silero(
+        audio_path: str,
+        min_segment_s: float = 10,
+        max_segment_s: float = 1800.0,
+        padding_s: float = 0.5,
+        silence_timeout_s: float = 0.8
+) -> List[Tuple[int, int]]:
+    """
+    Return list of (start_ms, end_ms) speech segments using Silero VAD with:
+        - padding_s: добавляет паузу перед и после сегмента
+        - silence_timeout_s: объединяет сегменты, разделённые короткой тишиной
+    """
 
-    model = load_silero_vad()  # загружаем модель
-    waveform, sr = torchaudio.load(audio_path)  # возвращает Tensor [channels, samples]
+    model = load_silero_vad()
+    waveform, sr = torchaudio.load(audio_path)
     if waveform.shape[0] > 1:
-        waveform = waveform[0]  # берем первый канал
+        waveform = waveform[0]
     waveform = waveform.squeeze()
 
-    # получаем сегменты речи
     speech_ts = get_speech_timestamps(waveform, model, sampling_rate=sr, return_seconds=True)
 
-    segments = []
+    # объединяем сегменты по таймауту короткой тишины
+    merged_segments = []
     for ts in speech_ts:
         start_s = ts['start']
         end_s = ts['end']
-        if end_s - start_s >= min_segment_s:
-            t = start_s
-            while t + max_segment_s < end_s:
-                segments.append((int(t * 1000), int((t + max_segment_s) * 1000)))
+        if merged_segments and start_s - merged_segments[-1][1] <= silence_timeout_s:
+            merged_segments[-1] = (merged_segments[-1][0], end_s)
+        else:
+            merged_segments.append((start_s, end_s))
+
+    # добавляем padding и делим на макс. длину
+    final_segments = []
+    for s, e in merged_segments:
+        s = max(s - padding_s, 0.0)
+        e = e + padding_s
+        if e - s >= min_segment_s:
+            t = s
+            while t + max_segment_s < e:
+                final_segments.append((int(t * 1000), int((t + max_segment_s) * 1000)))
                 t += max_segment_s
-            segments.append((int(t * 1000), int(end_s * 1000)))
-    return segments
+            final_segments.append((int(t * 1000), int(e * 1000)))
+
+    return final_segments
 
 
 def ffmpeg_cut(video_path: str, start_s: float, end_s: float, output_path: str):
