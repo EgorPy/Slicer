@@ -1,8 +1,7 @@
-""" Video slicer: split by human speech using webrtcvad + energy heuristics.
+""" Video slicer: split by human speech using Silero VAD (torch + torchaudio).
 
     - Extracts mono 16k WAV via MoviePy
-    - Uses webrtcvad to detect voice activity
-    - Uses RMS variability filter to reject music falsely classified as speech
+    - Uses Silero VAD to detect voice activity (accurate speech/music separation)
     - Splits long segments (> 3 minutes) and ignores very short segments
     - Cuts final clips with ffmpeg for Windows compatibility
 """
@@ -13,13 +12,15 @@ import os
 import subprocess
 import soundfile as sf
 import numpy as np
-import webrtcvad
 from typing import List, Tuple
+
+import torch
+import torchaudio
+from silero_vad import load_silero_vad, get_speech_timestamps
 
 
 def extract_audio(video_path: str, wav_path: str):
     """ Extract audio as mono 16kHz 16-bit WAV suitable for VAD """
-
     video = VideoFileClip(video_path)
     audio = video.audio
     audio.write_audiofile(
@@ -33,129 +34,39 @@ def extract_audio(video_path: str, wav_path: str):
 
 def load_wav_as_float(path: str):
     """ Load WAV and return float32 numpy array in range [-1, 1] and sample rate """
-
     data, sr = sf.read(path, dtype='float32')
     if data.ndim > 1:
         data = data[:, 0]
     return data, sr
 
 
-def frames_from_audio(audio: np.ndarray, sr: int, frame_ms: int):
-    """ Yield (frame_bytes, frame_array) for VAD and feature extraction """
+def vad_silero(audio_path: str, min_segment_s: float = 0.3, max_segment_s: float = 1800.0) -> List[Tuple[int, int]]:
+    """ Return list of (start_ms, end_ms) speech segments using Silero VAD via torchaudio """
 
-    frame_size = int(sr * frame_ms / 1000)
-    pad = (len(audio) % frame_size)
-    if pad != 0:
-        audio = np.concatenate([audio, np.zeros(frame_size - pad, dtype=audio.dtype)])
-    n_frames = len(audio) // frame_size
-    int16 = (audio * 32767).astype(np.int16)
-    for i in range(n_frames):
-        start = i * frame_size
-        end = start + frame_size
-        chunk = int16[start:end]
-        yield chunk.tobytes(), audio[start:end]
+    model = load_silero_vad()  # загружаем модель
+    waveform, sr = torchaudio.load(audio_path)  # возвращает Tensor [channels, samples]
+    if waveform.shape[0] > 1:
+        waveform = waveform[0]  # берем первый канал
+    waveform = waveform.squeeze()
 
+    # получаем сегменты речи
+    speech_ts = get_speech_timestamps(waveform, model, sampling_rate=sr, return_seconds=True)
 
-def compute_rms_array(frames_array: List[np.ndarray]):
-    """ Compute RMS per frame from list of numpy arrays """
-
-    rms = np.array([np.sqrt(np.mean(f.astype(np.float32) ** 2) + 1e-12) for f in frames_array], dtype=np.float32)
-    return rms
-
-
-def rolling_std(x: np.ndarray, window: int):
-    """ Fast rolling std using convolution """
-
-    if window <= 1:
-        return np.zeros_like(x)
-    c1 = np.convolve(x, np.ones(window, dtype=float), mode='same') / window
-    c2 = np.convolve(x * x, np.ones(window, dtype=float), mode='same') / window
-    var = c2 - c1 * c1
-    var[var < 0] = 0.0
-    return np.sqrt(var)
-
-
-def vad_with_music_filter(audio: np.ndarray,
-                          sr: int,
-                          frame_ms: int = 30,
-                          vad_mode: int = 2,
-                          padding_ms: int = 1200,
-                          rms_std_thresh: float = 0.002,
-                          rms_mean_thresh: float = 0.01,
-                          min_segment_ms: int = 300,
-                          max_segment_ms: int = 180000) -> List[Tuple[int, int]]:
-    """ Return list of (start_ms, end_ms) speech segments using VAD + energy filter """
-
-    vad = webrtcvad.Vad(vad_mode)
-
-    frame_bytes = []
-    frame_arrays = []
-    for b, arr in frames_from_audio(audio, sr, frame_ms):
-        frame_bytes.append(b)
-        frame_arrays.append(arr)
-
-    rms = compute_rms_array(frame_arrays)
-    window_frames = max(1, int(1000 / frame_ms))  # 1 second window
-    rms_std = rolling_std(rms, window_frames)
-
-    is_speech = [vad.is_speech(b, sr) for b in frame_bytes]
-
-    adjusted = []
-    for i, flag in enumerate(is_speech):
-        if not flag:
-            adjusted.append(False)
-            continue
-        if rms[i] >= rms_mean_thresh and rms_std[i] < rms_std_thresh:
-            adjusted.append(False)
-        else:
-            adjusted.append(True)
-
-    # collect segments with padding
-    frames = len(adjusted)
-    pad_frames = int(padding_ms / frame_ms)
     segments = []
-    start = None
-    silence_count = 0
-    for i, val in enumerate(adjusted):
-        if val:
-            if start is None:
-                start = i
-            silence_count = 0
-        else:
-            if start is not None:
-                silence_count += 1
-                if silence_count > pad_frames:
-                    seg_start_ms = start * frame_ms
-                    seg_end_ms = (i - silence_count + 1) * frame_ms
-                    if seg_end_ms - seg_start_ms >= min_segment_ms:
-                        segments.append((seg_start_ms, seg_end_ms))
-                    start = None
-                    silence_count = 0
-    if start is not None:
-        seg_start_ms = start * frame_ms
-        seg_end_ms = frames * frame_ms
-        if seg_end_ms - seg_start_ms >= min_segment_ms:
-            segments.append((seg_start_ms, seg_end_ms))
-
-    # split long segments
-    final = []
-    for s, e in segments:
-        length = e - s
-        if length <= max_segment_ms:
-            final.append((s, e))
-        else:
-            t = s
-            while t + max_segment_ms < e:
-                final.append((t, t + max_segment_ms))
-                t += max_segment_ms
-            final.append((t, e))
-
-    return final
+    for ts in speech_ts:
+        start_s = ts['start']
+        end_s = ts['end']
+        if end_s - start_s >= min_segment_s:
+            t = start_s
+            while t + max_segment_s < end_s:
+                segments.append((int(t * 1000), int((t + max_segment_s) * 1000)))
+                t += max_segment_s
+            segments.append((int(t * 1000), int(end_s * 1000)))
+    return segments
 
 
 def ffmpeg_cut(video_path: str, start_s: float, end_s: float, output_path: str):
     """ Cut segment with ffmpeg (re-encode for compatibility) """
-
     if end_s <= start_s + 0.001:
         return
     cmd = [
@@ -180,7 +91,6 @@ def ffmpeg_cut(video_path: str, start_s: float, end_s: float, output_path: str):
 
 def cut_video(video_path: str, segments: List[Tuple[int, int]], output_dir: str):
     """ Cut all segments and save to output_dir """
-
     os.makedirs(output_dir, exist_ok=True)
     for idx, (s_ms, e_ms) in enumerate(segments, start=1):
         start_s = s_ms / 1000.0
@@ -195,18 +105,10 @@ def main(video_path: str, output_dir: str):
     wav = "temp_audio.wav"
     extract_audio(video_path, wav)
     audio, sr = load_wav_as_float(wav)
+    if sr != 16000:
+        raise RuntimeError(f"Expected 16 kHz WAV, got {sr}")
 
-    segments = vad_with_music_filter(
-        audio,
-        sr,
-        frame_ms=30,
-        vad_mode=3,
-        padding_ms=1200,
-        rms_std_thresh=0.002,
-        rms_mean_thresh=0.01,
-        min_segment_ms=300,
-        max_segment_ms=180000
-    )
+    segments = vad_silero(wav)
 
     if not segments:
         print("No speech detected.")
