@@ -1,9 +1,14 @@
-""" Video slicer: split by human speech using Silero VAD (torch + torchaudio).
+""" Auto cutter: split by human speech using Silero VAD (torch + torchaudio).
 
     - Extracts mono 16k WAV via MoviePy
     - Uses Silero VAD to detect voice activity (accurate speech/music separation)
     - Splits long segments (> 3 minutes) and ignores very short segments
     - Cuts final clips with ffmpeg for Windows compatibility
+
+    The major problem of auto_cutter is that when silence times are inconsistent, the cutter cuts too early,
+    and when increasing silence_timeout_s the auto_cutter cuts too late.
+    In other words, the auto_cutter cuts specific moments too early and specific moments too late
+    and silence_timeout_s should change while running somehow.
 """
 
 from silero_vad import load_silero_vad, get_speech_timestamps
