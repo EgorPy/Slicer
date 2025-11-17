@@ -6,21 +6,18 @@
     - Cuts final clips with ffmpeg for Windows compatibility
 """
 
-from moviepy.video.io.VideoFileClip import VideoFileClip
-
-import os
-import subprocess
-import soundfile as sf
-import numpy as np
-from typing import List, Tuple
-
-import torch
-import torchaudio
 from silero_vad import load_silero_vad, get_speech_timestamps
+from moviepy.video.io.VideoFileClip import VideoFileClip
+from typing import List, Tuple
+import soundfile as sf
+import subprocess
+import torchaudio
+import os
 
 
 def extract_audio(video_path: str, wav_path: str):
     """ Extract audio as mono 16kHz 16-bit WAV suitable for VAD """
+
     video = VideoFileClip(video_path)
     audio = video.audio
     audio.write_audiofile(
@@ -34,6 +31,7 @@ def extract_audio(video_path: str, wav_path: str):
 
 def load_wav_as_float(path: str):
     """ Load WAV and return float32 numpy array in range [-1, 1] and sample rate """
+
     data, sr = sf.read(path, dtype='float32')
     if data.ndim > 1:
         data = data[:, 0]
@@ -44,7 +42,8 @@ def vad_silero(
         audio_path: str,
         min_segment_s: float = 10,
         max_segment_s: float = 1800.0,
-        padding_s: float = 0.5,
+        left_padding_s: float = 0.5,
+        right_padding_s: float = 1.5,
         silence_timeout_s: float = 0.8
 ) -> List[Tuple[int, int]]:
     """
@@ -61,7 +60,6 @@ def vad_silero(
 
     speech_ts = get_speech_timestamps(waveform, model, sampling_rate=sr, return_seconds=True)
 
-    # объединяем сегменты по таймауту короткой тишины
     merged_segments = []
     for ts in speech_ts:
         start_s = ts['start']
@@ -71,11 +69,10 @@ def vad_silero(
         else:
             merged_segments.append((start_s, end_s))
 
-    # добавляем padding и делим на макс. длину
     final_segments = []
     for s, e in merged_segments:
-        s = max(s - padding_s, 0.0)
-        e = e + padding_s
+        s = max(s - left_padding_s, 0.0)
+        e = e + right_padding_s
         if e - s >= min_segment_s:
             t = s
             while t + max_segment_s < e:
@@ -88,6 +85,7 @@ def vad_silero(
 
 def ffmpeg_cut(video_path: str, start_s: float, end_s: float, output_path: str):
     """ Cut segment with ffmpeg (re-encode for compatibility) """
+
     if end_s <= start_s + 0.001:
         return
     cmd = [
@@ -112,6 +110,7 @@ def ffmpeg_cut(video_path: str, start_s: float, end_s: float, output_path: str):
 
 def cut_video(video_path: str, segments: List[Tuple[int, int]], output_dir: str):
     """ Cut all segments and save to output_dir """
+
     os.makedirs(output_dir, exist_ok=True)
     for idx, (s_ms, e_ms) in enumerate(segments, start=1):
         start_s = s_ms / 1000.0
@@ -143,4 +142,7 @@ def main(video_path: str, output_dir: str):
 
 
 if __name__ == "__main__":
-    main(r"C:\Users\dmitry\Downloads\Family Guy S9E1.mp4", "clips")
+    main(
+        r"C:\Users\dmitry\Downloads\Family Guy S9E1.mp4",
+        "clips"
+    )
