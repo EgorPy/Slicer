@@ -242,6 +242,6 @@ def main(video_path: str, output_dir: str):
 
 if __name__ == "__main__":
     main(
-        r"C:\Users\dmitry\Downloads\Family Guy S9E1.mp4",
+        r"C:\Users\dmitry\Downloads\enS9E1.mp4",
         "clips"
     )
